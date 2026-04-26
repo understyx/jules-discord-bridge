@@ -110,7 +110,7 @@ async function fetchAttachments(msg) {
         const capMb = (cap / 1024 / 1024).toFixed(1);
         throw new Error(
           isImage
-            ? `image ${sizeMb}MB exceeds ${capMb}MB Anthropic API limit`
+            ? `image ${sizeMb}MB exceeds ${capMb}MB Jules API limit`
             : `attachment ${sizeMb}MB exceeds ${capMb}MB limit`
         );
       }
