@@ -1,14 +1,15 @@
 # jules-discord-bridge
 
-A Discord bot that wraps [`@google/jules-sdk`](https://www.npmjs.com/package/@google/jules-sdk) so each Discord channel becomes its own persistent Jules session.
+A Discord bot that wraps [`@google/jules-sdk`](https://www.npmjs.com/package/@google/jules-sdk) so each Discord channel becomes its own persistent Jules session — with **zero manual channel configuration**.
 
-- **Persistent sessions per channel.** Each channel gets its own Jules SDK session.
-- **Native file attachments.** Attached files get saved to `/tmp` with a path injected in the text.
-- **File-based access control.** A JSON file says which Discord channels are wired up, who can talk in them, and whether `@mention` is required.
-- **Survives restarts.** A small pointer file (`state/sessions.json`) maps `channelId → sessionId`; on next boot the SDK resumes the session.
-- **Turn count embed.** Every reply gets a tiny `Turn 12` footer so you can see where you are in the conversation.
+- **Fully automatic Discord structure.** The bot reads your Jules sources (GitHub repos) and sessions on startup, creates a Discord category per repo, a text channel per session, and a `#new-task` channel per repo for opening new sessions. No channel IDs to copy, no `access.json` to maintain.
+- **Live polling.** New Jules sessions and status changes are reflected in Discord automatically (default: every 2 minutes).
+- **Create tasks from Discord.** Send any message to a `#new-task` channel to start a new Jules session and get a dedicated channel for it.
+- **Native file attachments.** Attached files are saved to `/tmp` with the path injected into the message.
+- **Survives restarts.** `state/sessions.json` persists all mappings; on next boot sessions resume where they left off.
+- **Turn count embed.** Every reply carries a `Turn N` footer.
 
-> **Status: experimental.** Working in production for the author, but there are known bugs (see [Known issues](#known-issues)) and the security posture is permissive by design (see [Security](#security)).
+> **Status: experimental.** Working in production for the author but there are known limits (see [Known limits](#known-limits)) and the security posture is permissive by design (see [Security](#security)).
 
 ---
 
@@ -16,14 +17,11 @@ A Discord bot that wraps [`@google/jules-sdk`](https://www.npmjs.com/package/@go
 
 This bot runs the Jules SDK which executes agents in the cloud. They are fully capable coding agents and might read any source or execute commands if instructed.
 
-Treat your `access.json` like an SSH `authorized_keys` file. Specifically:
-
-- Use `allowFrom` to whitelist specific Discord user IDs. Don't leave channels open to "anyone in the server".
+- **Use `ALLOWED_USER_IDS`** to restrict which Discord user IDs can interact with bot channels. Otherwise anyone who can see the channel can talk to Jules.
 - Run the bot as a dedicated, unprivileged user — not your main account.
 - Don't run it on a host with secrets you wouldn't paste in a chat.
 - If you can, sandbox it (container, VM, separate machine).
-
-If this isn't the trade-off you want, this is the wrong project. A version with restricted permissions and an explicit allow-list of tools would be a meaningful fork.
+- Set channel permissions at the Discord level so only trusted members can see the Jules categories.
 
 ---
 
@@ -33,25 +31,8 @@ If this isn't the trade-off you want, this is the wrong project. A version with 
 git clone <your-fork>
 cd jules-discord-bridge
 npm install
-cp .env.example .env             # add your DISCORD_TOKEN and JULES_API_KEY
-cp access.json.example access.json  # add your channel IDs and user IDs
+cp .env.example .env   # fill in DISCORD_TOKEN, JULES_API_KEY, and GUILD_ID
 npm start
-```
-
-To run the smoke test (exercises ChannelAgent against a stale session ID):
-
-```bash
-npm test
-```
-
-To run as a systemd user service:
-
-```bash
-cp jules-discord-bridge.service.example ~/.config/systemd/user/jules-discord-bridge.service
-# edit paths inside, then
-systemctl --user daemon-reload
-systemctl --user enable --now jules-discord-bridge.service
-journalctl --user -u jules-discord-bridge -f
 ```
 
 ### Discord bot setup
@@ -59,80 +40,87 @@ journalctl --user -u jules-discord-bridge -f
 1. Create an application at <https://discord.com/developers/applications>.
 2. Add a bot, copy its token into `.env` as `DISCORD_TOKEN`.
 3. Enable the **Message Content Intent** under "Bot → Privileged Gateway Intents".
-4. Invite the bot to your server with the `bot` scope and `Send Messages` + `Read Message History` permissions.
-5. Right-click each channel you want to enable → "Copy Channel ID" (Developer Mode required) → put the IDs in `access.json`.
+4. Invite the bot to your server with the `bot` scope and these permissions:
+   - **Send Messages**, **Read Message History**, **View Channels**
+   - **Manage Channels** — required to create categories and text channels automatically.
+5. Right-click your server → **Copy Server ID** (Developer Mode required) and set it as `GUILD_ID` in `.env`.
+
+That's it. On next start the bot will create the Discord structure for all connected repos and sessions.
 
 ---
 
 ## How it works
 
+### Auto-managed mode (`GUILD_ID` set)
+
 ```
-Discord message
+Bot ready
    ↓
-discord.js messageCreate
+syncJulesToDiscord()
+   ├─ julesClient.sources()   → one Discord category per GitHub repo
+   │                             └─ #new-task channel inside each category
+   └─ julesClient.sessions()  → one Discord text channel per Jules session
+          └─ posts initial status message if channel is new
+
+Recurring poll (every POLL_INTERVAL_MS)
+   └─ same sync — picks up new sessions, posts status-change notifications
+
+User sends message to #new-task
+   └─ handleNewTask() creates Jules session + Discord channel, forwards message
+
+User sends message to #task-XXXXXXXX
+   └─ normal turn via ChannelAgent (same as legacy mode)
+```
+
+```
+Discord message (session channel or #new-task)
    ↓
-shouldProcess()  ← access.json check (group, allowFrom, requireMention)
+shouldProcess()  ← managed channel check OR access.json fallback
    ↓
 queues.get(channelId).push(message)        ← per-channel FIFO
    ↓
-processQueue()  ← channelBusy guard, one turn at a time per channel
-   ↓
-buildContent(text, attachments)
-   → string
-   ↓
-getAgent(channelId)  ← reuse the persistent ChannelAgent
-   ↓
-agent.send(content, systemPrompt, source)
-   ↓
-session.send(content) + session.updates() stream
-   ↓
-Jules SDK uses Jules API
-   ↓
-receives agentMessaged / planGenerated / artifacts / sessionCompleted activities
-   ↓
-_handleTurnResult()  ← formats text + artifacts, handles plan approval pause
-   ↓
-msg.reply(text) + turn count embed
+processQueue()
+   ├─ #new-task channel → handleNewTask() → new session + new channel
+   └─ session channel   → ChannelAgent.send() → Jules SDK → reply
 ```
 
-Each channel gets one `ChannelAgent` instance, which keeps a Jules session active.
+### Legacy mode (no `GUILD_ID`)
+
+Falls back to `access.json`-based configuration — same behaviour as before.
 
 ### Streaming and artifacts
 
-Every turn now uses `session.send()` + `session.updates()` (reactive stream) instead of the blocking `session.ask()`. This lets the bridge:
+Every turn uses `session.send()` + `session.updates()` (reactive stream). This lets the bridge:
 
-- Detect plan-approval pauses (`planGenerated` + `awaitingPlanApproval` state) and show the plan to users before the agent starts executing.
-- Surface `bashOutput` artifacts as fenced code blocks in the Discord reply.
+- Detect plan-approval pauses (`planGenerated` + `awaitingPlanApproval`) and show the plan before execution.
+- Surface `bashOutput` artifacts as fenced code blocks.
 - Surface `changeSet` artifacts as a per-file diff summary (`path: +N -M`).
-- Note `media` artifacts inline so users know something was generated.
-
-### GitHub source per channel
-
-Each channel entry in `access.json` can carry an optional `source` field that is forwarded to `jules.session()` when a new session is created.  Sessions linked to a repository can read and modify the repo's code, and they will pause for plan approval before making changes.
-
-```json
-"source": { "github": "your-org/your-repo", "baseBranch": "main" }
-```
+- Note `media` artifacts inline.
 
 ### Plan approval flow
 
-When Jules finishes analyzing a repository and presents a plan:
+When Jules presents a plan:
 
-1. The bridge sends the numbered plan to Discord and instructs the user to reply with `!!approve`.
-2. Sending `!!approve` calls `session.approve()` and resumes the stream — the agent executes the plan and the result (with any diff artifacts) is sent back.
+1. The bridge sends the numbered plan to Discord and asks for `!!approve`.
+2. Sending `!!approve` calls `session.approve()` and resumes the stream.
 3. Sending `!!clear` discards the session entirely.
-
 
 ### Session storage
 
-Across restarts, `state/sessions.json` (in the bridge directory) is the pointer file mapping each channel to its session ID. When the bridge wakes, it reads this map and calls `jules.session(sessionId)`.
+`state/sessions.json` persists all channel → session mappings (including auto-managed ones). On restart, the bot rebuilds its in-memory state from this file and re-registers managed channels without re-querying Discord.
+
+---
 
 ## Special commands
 
-- `!!clear` in any allowed channel — closes the agent for that channel, drops the session pointer and turn count, recreates fresh on the next message.
-- `!!approve` — when Jules has generated a plan and is waiting for your approval, send this command to approve it and let the agent proceed.
-- `!!sources` — list all GitHub repositories (and other sources) connected to your Jules account.
-- `!!sessions` — show the five most recent Jules sessions cached locally, with their states.
+These work in any session channel (including auto-managed ones):
+
+| Command | Description |
+|---|---|
+| `!!clear` | Close the agent, drop the session pointer and turn count. Next message starts a fresh session. |
+| `!!approve` | Approve a Jules plan that is waiting for human confirmation. |
+| `!!sources` | List all GitHub repos (and other sources) connected to your Jules account. |
+| `!!sessions` | Show the five most recent Jules sessions with their states. |
 
 ---
 
@@ -140,48 +128,53 @@ Across restarts, `state/sessions.json` (in the bridge directory) is the pointer 
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `DISCORD_TOKEN` | (required) | Bot token from the Discord developer portal |
-| `JULES_API_KEY` | (required) | API key for Google Jules SDK |
-| `ACCESS_JSON` | `./access.json` | Path to access policy JSON |
+| `DISCORD_TOKEN` | *(required)* | Bot token from the Discord developer portal |
+| `JULES_API_KEY` | *(required)* | API key for Google Jules SDK |
+| `GUILD_ID` | — | Discord server ID. **Set this to enable auto-managed mode.** |
+| `POLL_INTERVAL_MS` | `120000` | How often (ms) to re-sync Jules → Discord. Min 10 000. |
+| `SYNC_SESSION_LIMIT` | `50` | How many most-recent Jules sessions to sync per poll cycle. |
+| `ALLOWED_USER_IDS` | — | Comma-separated Discord user IDs allowed in managed channels. Unset = anyone. |
+| `ACCESS_JSON` | `./access.json` | Path to legacy access policy JSON (optional when `GUILD_ID` is set) |
 | `STATE_DIR` | `./state` | Where `sessions.json` lives |
 | `MAX_ATTACHMENT_BYTES` | `26214400` (25 MiB) | Cap on per-attachment download size |
 | `MAX_IMAGE_BYTES` | `5242880` (5 MiB) | Cap on per-image attachment |
 | `IDLE_MINUTES` | `30` | Close agents idle for this long. State persists; next message resumes. `0` disables. |
 | `MAX_ACTIVE_AGENTS` | `8` | Cap on simultaneously-live agents. LRU eviction when exceeded. |
 
-### `access.json` schema
+### `access.json` (legacy / optional)
+
+Only needed when `GUILD_ID` is not set. When `GUILD_ID` is set, this file is ignored unless a channel is listed in it — in which case its `allowFrom` / `requireMention` / `systemPrompt` / `source` settings still apply for that channel.
 
 ```json
 {
   "groups": {
     "<channelId>": {
-      "allowFrom": ["<userId>", ...],   // optional whitelist; omit to allow anyone in the channel
-      "requireMention": true,            // if true, only respond when @mentioned or replied-to
-      "systemPrompt": "...",             // optional system prompt for new sessions
-      "source": {                        // optional Jules source — links sessions to a GitHub repo
-        "github": "owner/repo",
-        "baseBranch": "main"
-      }
+      "allowFrom": ["<userId>", ...],
+      "requireMention": true,
+      "systemPrompt": "...",
+      "source": { "github": "owner/repo", "baseBranch": "main" }
     }
   }
 }
 ```
-
-The file is hot-reloaded on `mtime` change — edit it without restarting.
 
 ---
 
 ## Known limits
 
 - **Single-tenant assumption.** All channels share one process, one Discord token.
-- **Stale-session recovery costs one turn.** If the bridge restarts pointing at a session that no longer exists, resending succeeds against a freshly created session.
+- **Stale-session recovery costs one turn.** If the bridge restarts pointing at a session that no longer exists, the next message succeeds against a freshly created session.
+- **Historical activity not replayed.** The Jules SDK streaming API is real-time only. When a session channel is first created for an already-completed session, only its final state is shown — past messages are not retrieved.
+- **Discord rate limits.** Creating many categories/channels at once (e.g., first boot with many existing sessions) may trigger Discord rate limits. The bot retries gracefully but initial sync may take a few seconds.
 
 ---
 
 ## Architecture notes for forkers
 
 - `bridge.mjs` is intentionally one file. If you're comfortable reading Node, the whole thing fits in your head.
-- `ChannelAgent` (the per-channel persistent SDK wrapper) is the meat. Everything else is plumbing.
+- `ChannelAgent` (the per-channel persistent SDK wrapper) is unchanged from the original design.
+- `syncJulesToDiscord` / `syncOneSession` / `handleNewTask` are the new pieces for auto-management.
+- `state/sessions.json` now also stores `managedSessions`, `managedCategories`, and `newTaskChannels` so the full Discord structure survives restarts.
 
 ---
 
