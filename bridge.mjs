@@ -16,6 +16,23 @@ const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 25 * 1024 * 1024);
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
 
+// Auto-sync / managed mode — enabled when GUILD_ID is set.
+// The bot discovers Jules sources and sessions and builds the full Discord
+// category / channel structure automatically; access.json is not required.
+const GUILD_ID = process.env.GUILD_ID || null;
+// How often (ms) to re-poll Jules for new/updated sessions. Min 10 s.
+const POLL_INTERVAL_MS = Math.max(10_000, Number(process.env.POLL_INTERVAL_MS || 120_000));
+// How many sessions to retrieve per sync cycle (most-recent N).
+const SYNC_SESSION_LIMIT = Math.max(1, Number(process.env.SYNC_SESSION_LIMIT || 50));
+// Optional comma-separated Discord user IDs allowed to interact with managed
+// channels. Leave unset to allow everyone who can see the channel.
+const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS
+  ? new Set(process.env.ALLOWED_USER_IDS.split(',').map((s) => s.trim()).filter(Boolean))
+  : null;
+
+// Name used for the per-repo "create a new task" control channel.
+const NEW_TASK_CHANNEL_NAME = 'new-task';
+
 // Agent lifecycle. Each ChannelAgent holds a persistent session.
 // MCP children, costing ~500-600MB resident. To keep memory bounded:
 //   - Idle agents are closed after IDLE_MINUTES of inactivity. Their session
@@ -31,15 +48,34 @@ const MAX_ACTIVE_AGENTS = Math.max(1, Number(process.env.MAX_ACTIVE_AGENTS || 8)
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
 // ----- state -----
-const sessions = new Map();
-const turnCounts = new Map();
+const sessions = new Map();       // Discord channelId → Jules sessionId
+const turnCounts = new Map();     // Discord channelId → turn count
+
+// Auto-managed state (populated by syncJulesToDiscord / handleNewTask):
+//   managedSessions:   Jules sessionId → { channelId, repo, state }
+//   managedCategories: "owner/repo"    → Discord categoryId
+//   newTaskChannels:   Discord channelId → "owner/repo"
+const managedSessions = new Map();
+const managedCategories = new Map();
+const newTaskChannels = new Map();
+
+// Reference to the Discord guild used in auto-managed mode (set on ready).
+let managedGuild = null;
 
 function loadState() {
   try {
     const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     for (const [k, v] of Object.entries(data.sessions || {})) sessions.set(k, v);
     for (const [k, v] of Object.entries(data.turns || {})) turnCounts.set(k, v);
-    console.log(`[state] loaded ${sessions.size} sessions from ${STATE_FILE}`);
+    for (const [k, v] of Object.entries(data.managedSessions || {})) managedSessions.set(k, v);
+    for (const [k, v] of Object.entries(data.managedCategories || {})) managedCategories.set(k, v);
+    for (const [k, v] of Object.entries(data.newTaskChannels || {})) newTaskChannels.set(k, v);
+    // Rebuild the channelId → sessionId map from managed sessions so that
+    // ChannelAgent can resume sessions without access.json entries.
+    for (const [sessionId, info] of managedSessions) {
+      if (!sessions.has(info.channelId)) sessions.set(info.channelId, sessionId);
+    }
+    console.log(`[state] loaded ${sessions.size} sessions, ${managedSessions.size} managed from ${STATE_FILE}`);
   } catch (err) {
     if (err.code !== 'ENOENT') console.error(`[state] load failed: ${err.message}`);
   }
@@ -53,6 +89,9 @@ function saveState() {
     const data = {
       sessions: Object.fromEntries(sessions),
       turns: Object.fromEntries(turnCounts),
+      managedSessions: Object.fromEntries(managedSessions),
+      managedCategories: Object.fromEntries(managedCategories),
+      newTaskChannels: Object.fromEntries(newTaskChannels),
     };
     try {
       fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify(data, null, 2));
@@ -81,6 +120,19 @@ function loadAccess() {
 
 async function shouldProcess(message, clientUserId) {
   if (message.author.bot) return false;
+
+  // Optional allowlist for auto-managed mode.
+  if (ALLOWED_USER_IDS && !ALLOWED_USER_IDS.has(message.author.id)) return false;
+
+  // Auto-managed channels: any Discord channel that maps to a known Jules
+  // session or is a "new-task" control channel.
+  if (GUILD_ID) {
+    if (newTaskChannels.has(message.channel.id)) return true;
+    const channelSessionId = sessions.get(message.channel.id);
+    if (channelSessionId && managedSessions.has(channelSessionId)) return true;
+  }
+
+  // Legacy access.json path (still supported when access.json exists).
   const access = loadAccess();
   const group = access.groups?.[message.channel.id];
   if (!group) return false;
@@ -290,6 +342,308 @@ class ChannelAgent {
   }
 }
 
+// ----- auto-sync helpers -----
+
+/** Produce a valid Discord channel/category name from an arbitrary string. */
+function sanitizeChannelName(name) {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 100);
+}
+
+/** Discord category name for a given "owner/repo" string. */
+function repoCategoryName(repo) {
+  return sanitizeChannelName(`jules-${repo}`);
+}
+
+/** Discord channel name for a Jules session. */
+function sessionChannelName(sessionId) {
+  return `task-${sessionId.slice(0, 8)}`;
+}
+
+/**
+ * Extract the "owner/repo" string from a Jules session object.
+ * Handles both the `githubRepo` shape and the plain `github` string.
+ */
+function extractRepo(session) {
+  if (!session?.source) return null;
+  if (session.source.githubRepo) {
+    const { owner, repo } = session.source.githubRepo;
+    return `${owner}/${repo}`;
+  }
+  if (typeof session.source.github === 'string') return session.source.github;
+  return null;
+}
+
+/** Find or create a Discord category for a repo. */
+async function getOrCreateCategory(guild, repo) {
+  const name = repoCategoryName(repo);
+  const existing = guild.channels.cache.find(
+    (c) => c.type === ChannelType.GuildCategory && c.name === name,
+  );
+  if (existing) return existing;
+  console.log(`[sync] creating category: ${name}`);
+  return guild.channels.create({ name, type: ChannelType.GuildCategory });
+}
+
+/**
+ * Ensure the special `#new-task` control channel exists inside `categoryId`.
+ * Registers it in `newTaskChannels` so messages there trigger session creation.
+ */
+async function ensureNewTaskChannel(guild, repo) {
+  const categoryId = managedCategories.get(repo);
+  if (!categoryId) return;
+
+  const existing = guild.channels.cache.find(
+    (c) => c.parentId === categoryId && c.name === NEW_TASK_CHANNEL_NAME,
+  );
+  let ch = existing;
+  if (!ch) {
+    ch = await guild.channels.create({
+      name: NEW_TASK_CHANNEL_NAME,
+      type: ChannelType.GuildText,
+      parent: categoryId,
+      topic: `Send any message here to open a new Jules task for ${repo}.`,
+    });
+    console.log(`[sync] created #${NEW_TASK_CHANNEL_NAME} for ${repo}: ${ch.id}`);
+  }
+
+  if (!newTaskChannels.has(ch.id)) {
+    newTaskChannels.set(ch.id, repo);
+    saveState();
+  }
+}
+
+/**
+ * Reconcile a single Jules session with Discord:
+ *   - If we already track it and its state changed, post a notification.
+ *   - If it is new, create (or find) the text channel and register it.
+ */
+async function syncOneSession(guild, session) {
+  const sessionId = session.id;
+  const newState = session.state;
+
+  if (managedSessions.has(sessionId)) {
+    const managed = managedSessions.get(sessionId);
+    if (managed.state !== newState) {
+      managed.state = newState;
+      saveState();
+      try {
+        const ch = guild.channels.cache.get(managed.channelId);
+        if (ch) {
+          await ch.send(`ℹ️ **Status updated:** \`${newState}\``).catch((err) => {
+            console.error(`[sync] status update send failed for ${sessionId}: ${err.message}`);
+          });
+        }
+      } catch (err) {
+        console.error(`[sync] status update error for ${sessionId}: ${err.message}`);
+      }
+    }
+    return;
+  }
+
+  // New session — determine which repo/category it belongs to.
+  const repo = extractRepo(session);
+  let categoryId = repo ? managedCategories.get(repo) : null;
+
+  if (repo && !categoryId) {
+    try {
+      const cat = await getOrCreateCategory(guild, repo);
+      managedCategories.set(repo, cat.id);
+      saveState();
+      categoryId = cat.id;
+      await ensureNewTaskChannel(guild, repo);
+    } catch (err) {
+      console.error(`[sync] category for ${repo}: ${err.message}`);
+    }
+  }
+
+  const chName = sessionChannelName(sessionId);
+  // Use an exact category match; if categoryId is null, look for a top-level
+  // channel (parentId is null) to avoid false matches across categories.
+  const existing = guild.channels.cache.find(
+    (c) => c.name === chName && c.parentId === (categoryId ?? null),
+  );
+
+  try {
+    let ch = existing;
+    if (!ch) {
+      ch = await guild.channels.create({
+        name: chName,
+        type: ChannelType.GuildText,
+        parent: categoryId ?? undefined,
+        topic: `Jules session ${sessionId}${repo ? ` — ${repo}` : ''}`,
+      });
+      const repoLine = repo ? `\nRepo: \`${repo}\`` : '';
+      await ch
+        .send(
+          `📋 **Jules Session** \`${sessionId}\`\n` +
+            `Status: **${newState}**${repoLine}\n\n` +
+            `Send a message here to interact with this session.`,
+        )
+        .catch(() => {});
+    }
+
+    managedSessions.set(sessionId, { channelId: ch.id, repo: repo ?? null, state: newState });
+    sessions.set(ch.id, sessionId);
+    saveState();
+    console.log(`[sync] session ${sessionId} → #${ch.name} (${ch.id})`);
+  } catch (err) {
+    console.error(`[sync] failed for session ${sessionId}: ${err.message}`);
+  }
+}
+
+/**
+ * Full Jules → Discord sync:
+ *   1. Enumerate Jules sources → create/find categories + #new-task channels.
+ *   2. Enumerate Jules sessions → create/find per-session text channels.
+ */
+async function syncJulesToDiscord(guild) {
+  console.log('[sync] Jules → Discord sync starting');
+
+  // Refresh the guild channel cache once per sync cycle.
+  await guild.channels.fetch();
+
+  // Step 1: sources → categories.
+  try {
+    for await (const source of julesClient.sources()) {
+      if (source.type === 'githubRepo') {
+        const repo = `${source.githubRepo.owner}/${source.githubRepo.repo}`;
+        if (!managedCategories.has(repo)) {
+          try {
+            const cat = await getOrCreateCategory(guild, repo);
+            managedCategories.set(repo, cat.id);
+            saveState();
+          } catch (err) {
+            console.error(`[sync] category for ${repo}: ${err.message}`);
+          }
+        }
+        await ensureNewTaskChannel(guild, repo);
+      }
+    }
+  } catch (err) {
+    console.error(`[sync] sources error: ${err.message}`);
+  }
+
+  // Step 2: sessions → channels.
+  try {
+    const sessionList = await julesClient.select({
+      from: 'sessions',
+      order: 'desc',
+      limit: SYNC_SESSION_LIMIT,
+    });
+    for (const session of sessionList ?? []) {
+      await syncOneSession(guild, session);
+    }
+  } catch (err) {
+    console.error(`[sync] sessions error: ${err.message}`);
+  }
+
+  console.log(
+    `[sync] done — ${managedSessions.size} sessions, ${managedCategories.size} repos`,
+  );
+}
+
+/** Schedule recurring re-syncs so new Jules sessions surface in Discord. */
+let _pollTimer = null;
+function schedulePoll(guild) {
+  if (_pollTimer) clearTimeout(_pollTimer);
+  _pollTimer = setTimeout(async () => {
+    _pollTimer = null;
+    try {
+      await syncJulesToDiscord(guild);
+    } catch (err) {
+      console.error(`[poll] sync error: ${err.message}`);
+    }
+    schedulePoll(guild);
+  }, POLL_INTERVAL_MS);
+  _pollTimer.unref?.();
+}
+
+/**
+ * Handle a message sent to a `#new-task` channel.
+ * Creates a new Jules session for the associated repo, opens a dedicated text
+ * channel for it, and forwards the user's message as the first turn.
+ * Only called when `managedGuild` is set (GUILD_ID is configured).
+ */
+async function handleNewTask(msg, repo, baseText, attachments) {
+  const content = buildContent(baseText, attachments);
+  if (!content) {
+    await msg.reply('Please include a task description.').catch(() => {});
+    return;
+  }
+
+  try {
+    await msg.channel.sendTyping().catch(() => {});
+
+    const categoryId = managedCategories.get(repo);
+
+    // Build the Jules source object. repo is always "owner/repo" format here
+    // (populated from extractRepo / newTaskChannels.set), so the slash is guaranteed.
+    const source = { github: repo, baseBranch: 'main' };
+    const systemPrompt = `You are a helpful coding agent working on ${repo}.`;
+
+    // Create the Jules session.
+    const sessionOpts = { prompt: systemPrompt, source };
+    const newSession = await julesClient.session(sessionOpts);
+
+    // Create the Discord text channel for this session.
+    const chName = sessionChannelName(newSession.id);
+    const ch = await managedGuild.channels.create({
+      name: chName,
+      type: ChannelType.GuildText,
+      parent: categoryId ?? undefined,
+      topic: `Jules session ${newSession.id} — ${repo}`,
+    });
+
+    managedSessions.set(newSession.id, { channelId: ch.id, repo, state: 'created' });
+    sessions.set(ch.id, newSession.id);
+    saveState();
+    console.log(`[new-task] ${repo} → session ${newSession.id} → #${ch.name} (${ch.id})`);
+
+    await msg
+      .reply(`✅ Opened <#${ch.id}> for \`${repo}\`. Sending your task now…`)
+      .catch(() => {});
+
+    // Forward the user's message as the first turn inside the new channel.
+    const agent = getAgent(ch.id);
+    const t0 = Date.now();
+    const result = await agent.send(content, systemPrompt, source);
+    console.log(`[new-task] first turn done in ${Date.now() - t0}ms`);
+
+    if (result.awaitingApproval) {
+      const planText = formatPlan(result.plan);
+      const preText = result.text ? `${result.text}\n\n` : '';
+      await ch
+        .send(
+          `${preText}**Jules has generated a plan and is waiting for your approval:**\n${planText}\n\n` +
+            'Reply with `!!approve` to proceed, or `!!clear` to cancel.',
+        )
+        .catch(() => {});
+      return;
+    }
+
+    turnCounts.set(ch.id, (turnCounts.get(ch.id) || 0) + 1);
+    saveState();
+
+    const mainText = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
+    const artifactText = formatArtifacts(result.artifacts || []);
+    const fullText = artifactText ? `${mainText}\n\n${artifactText}` : mainText;
+    const chunks = splitMessage(fullText);
+    const barEmbed = buildContextEmbed(ch.id);
+    for (let i = 0; i < chunks.length; i++) {
+      if (i === chunks.length - 1) await ch.send({ content: chunks[i], embeds: [barEmbed] });
+      else await ch.send(chunks[i]);
+    }
+  } catch (err) {
+    console.error(`[new-task] ${repo}: ${err.message}`);
+    await msg.reply(`Error creating session: ${err.message}`).catch(() => {});
+  }
+}
+
 // ----- bridge -----
 const agents = new Map();
 const queues = new Map();
@@ -347,8 +701,11 @@ async function processQueue(channelId) {
     if (baseText === '!!clear') {
       const a = agents.get(channelId);
       if (a) { a.close(); agents.delete(channelId); }
+      const sessionId = sessions.get(channelId);
       sessions.delete(channelId);
       turnCounts.delete(channelId);
+      // Clean up managed-session tracking so the channel is no longer treated as active.
+      if (sessionId) managedSessions.delete(sessionId);
       saveState();
       console.log(`[${channelId}] cleared by !!clear`);
       await msg.reply('Session cleared. Next message starts fresh.').catch(() => {});
@@ -413,6 +770,14 @@ async function processQueue(channelId) {
       } catch (err) {
         await msg.reply(`Error querying sessions: ${err.message}`).catch(() => {});
       }
+      continue;
+    }
+
+    // ----- new-task channel -----
+    // Messages in a #new-task channel create a brand-new Jules session and
+    // open a dedicated text channel for it — skip all normal session logic.
+    if (newTaskChannels.has(channelId)) {
+      await handleNewTask(msg, newTaskChannels.get(channelId), baseText, attachments);
       continue;
     }
 
@@ -492,11 +857,23 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-client.on('ready', () => {
+client.on('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Access: ${ACCESS_JSON}`);
   console.log(`State: ${STATE_FILE}`);
   loadAccess();
+
+  if (GUILD_ID) {
+    try {
+      managedGuild = await client.guilds.fetch(GUILD_ID);
+      await managedGuild.channels.fetch();
+      await syncJulesToDiscord(managedGuild);
+      schedulePoll(managedGuild);
+      console.log(`[sync] auto-managed mode active (guild ${GUILD_ID}, poll every ${POLL_INTERVAL_MS / 1000}s)`);
+    } catch (err) {
+      console.error(`[sync] guild setup failed: ${err.message}`);
+    }
+  }
 });
 
 client.on('messageCreate', async (message) => {
