@@ -7,23 +7,65 @@ import fs from 'node:fs';
 
 export const IMAGE_MIME = /^image\/(png|jpe?g|gif|webp)$/i;
 
-export const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
+// Max characters shown per bash artifact in a Discord reply.
+const BASH_ARTIFACT_MAX = 1400;
 
-// Resolve a permission-mode string against the SDK's allowed set, falling back
-// to 'bypassPermissions' (with a warning) for invalid values. Pulled out of
-// bridge.mjs so we can unit-test the validation without booting Discord.
-export function resolvePermissionMode(raw, logger = console.error) {
-  const value = raw || 'bypassPermissions';
-  if (!PERMISSION_MODES.includes(value)) {
-    logger(`[config] invalid PERMISSION_MODE='${raw}', falling back to 'bypassPermissions'`);
-    return 'bypassPermissions';
+/**
+ * Format a plan object (from a `planGenerated` activity) into a human-readable
+ * numbered list suitable for a Discord message.
+ *
+ * @param {object|null} plan - Jules plan object with a `steps` array.
+ * @returns {string}
+ */
+export function formatPlan(plan) {
+  if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
+    return '*(no plan details)*';
   }
-  return value;
+  return plan.steps.map((s, i) => `${i + 1}. ${s.title}`).join('\n');
+}
+
+/**
+ * Format an array of Jules activity artifacts into a Discord-ready string.
+ * Handles `bashOutput` (code block) and `changeSet` (diff summary).
+ * Media artifacts are noted but not embedded.
+ *
+ * @param {Array} artifacts
+ * @returns {string} May be empty string if there are no displayable artifacts.
+ */
+export function formatArtifacts(artifacts) {
+  if (!artifacts || artifacts.length === 0) return '';
+  const parts = [];
+  for (const artifact of artifacts) {
+    try {
+      if (artifact.type === 'bashOutput') {
+        const raw = artifact.toString();
+        if (raw && raw.trim()) {
+          const truncated =
+            raw.length > BASH_ARTIFACT_MAX
+              ? raw.slice(0, BASH_ARTIFACT_MAX) + '\n…(truncated)'
+              : raw;
+          parts.push(`\`\`\`\n${truncated}\n\`\`\``);
+        }
+      } else if (artifact.type === 'changeSet') {
+        const parsed = artifact.parsed();
+        if (parsed && parsed.files && parsed.files.length > 0) {
+          const lines = parsed.files.map(
+            (f) => `\`${f.path}\`: +${f.additions} -${f.deletions}`
+          );
+          parts.push(`**Changes:**\n${lines.join('\n')}`);
+        }
+      } else if (artifact.type === 'media') {
+        parts.push(`*(media: ${artifact.format ?? 'unknown format'})*`);
+      }
+    } catch {
+      // skip malformed artifacts
+    }
+  }
+  return parts.join('\n\n');
 }
 
 export function buildContent(text, attachments) {
-  const blocks = [];
-  if (text) blocks.push({ type: 'text', text });
+  let contentText = text || '';
 
   const failed = [];
   const savedPaths = [];
@@ -32,13 +74,8 @@ export function buildContent(text, attachments) {
       failed.push(`${att.name ?? 'unnamed'} (failed: ${att.error})`);
       continue;
     }
-    if (att.data && att.type && IMAGE_MIME.test(att.type)) {
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: att.type, data: att.data.toString('base64') },
-      });
-    } else if (att.data) {
-      // Non-image: write to /tmp and inject path so Claude can Read it
+    if (att.data) {
+      // Write to /tmp and inject path so agent can Read it
       const safe = (att.name || 'unnamed').replace(/[^a-zA-Z0-9._-]/g, '_');
       const dest = `/tmp/discord-${Date.now()}-${safe}`;
       fs.writeFileSync(dest, att.data);
@@ -49,13 +86,11 @@ export function buildContent(text, attachments) {
     let note = '';
     if (savedPaths.length) note += `\n\n[attachments: ${savedPaths.join(', ')}]`;
     if (failed.length) note += `\n\n[failed: ${failed.join(', ')}]`;
-    if (blocks.length === 0) blocks.push({ type: 'text', text: '(attachment)' });
-    blocks[0].text = (blocks[0].text || '') + note;
+    if (!contentText) contentText = '(attachment)';
+    contentText += note;
   }
 
-  if (blocks.length === 0) return null;
-  if (blocks.length === 1 && blocks[0].type === 'text') return blocks[0].text;
-  return blocks;
+  return contentText || null;
 }
 
 export function splitMessage(text, maxLen = 2000) {

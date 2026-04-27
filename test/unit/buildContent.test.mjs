@@ -65,31 +65,7 @@ test('empty text and no attachments returns null', () => {
   assert.equal(out, null);
 });
 
-test('image attachment returns a blocks array with type:image and base64 data', () => {
-  const data = Buffer.from([1, 2, 3, 4, 5]);
-  const out = buildContent('check this', [
-    { name: 'pic.png', type: 'image/png', size: data.length, data },
-  ]);
-  assert.ok(Array.isArray(out), 'expected blocks array');
-  assert.equal(out.length, 2);
-  assert.deepEqual(out[0], { type: 'text', text: 'check this' });
-  assert.equal(out[1].type, 'image');
-  assert.equal(out[1].source.type, 'base64');
-  assert.equal(out[1].source.media_type, 'image/png');
-  assert.equal(out[1].source.data, data.toString('base64'));
-});
-
-test('image MIME variants (jpeg, JPG, webp) all produce image blocks', () => {
-  for (const type of ['image/jpeg', 'IMAGE/JPG', 'image/webp', 'image/gif']) {
-    const data = Buffer.from('xyz');
-    const out = buildContent('hi', [{ name: 'f', type, size: 3, data }]);
-    assert.ok(Array.isArray(out), `${type} should produce blocks`);
-    assert.equal(out[1].type, 'image');
-    assert.equal(out[1].source.media_type, type);
-  }
-});
-
-test('non-image attachment is written to /tmp and noted in the text', () => {
+test('attachment is written to /tmp and noted in the text', () => {
   const data = Buffer.from('hello pdf bytes');
   let out;
   trackTmp(() => {
@@ -97,7 +73,6 @@ test('non-image attachment is written to /tmp and noted in the text', () => {
       { name: 'doc.pdf', type: 'application/pdf', size: data.length, data },
     ]);
   });
-  // text-only result: blocks collapses to the string when only block 0 (text) survives.
   assert.equal(typeof out, 'string');
   assert.match(out, /^look at this/);
   assert.match(out, /\[attachments: \/tmp\/discord-\d+-doc\.pdf \(application\/pdf, 15b\)\]/);
@@ -107,6 +82,19 @@ test('non-image attachment is written to /tmp and noted in the text', () => {
   assert.ok(match, 'should have written a /tmp path');
   const written = fs.readFileSync(match[0]);
   assert.deepEqual(written, data);
+});
+
+test('image attachment is also written to /tmp and noted in the text', () => {
+  const data = Buffer.from([1, 2, 3, 4, 5]);
+  let out;
+  trackTmp(() => {
+    out = buildContent('check this', [
+      { name: 'pic.png', type: 'image/png', size: data.length, data },
+    ]);
+  });
+  assert.equal(typeof out, 'string');
+  assert.match(out, /^check this/);
+  assert.match(out, /\[attachments: \/tmp\/discord-\d+-pic\.png \(image\/png, 5b\)\]/);
 });
 
 test('non-image attachment with no name uses "unnamed" placeholder', () => {
@@ -158,16 +146,17 @@ test('attachments-only with no text gets a (attachment) placeholder', () => {
   assert.match(out, /\[attachments: \/tmp\/discord-\d+-doc\.pdf/);
 });
 
-test('image-only with no text returns just the image block (no placeholder)', () => {
-  // Image-only path doesn't trigger the savedPaths/failed placeholder branch
-  // — blocks already has the image, and there's no text block to inject into.
+test('image-only with no text gets a (attachment) placeholder and notes the /tmp path', () => {
   const data = Buffer.from('img');
-  const out = buildContent('', [
-    { name: 'p.png', type: 'image/png', size: 3, data },
-  ]);
-  assert.ok(Array.isArray(out));
-  assert.equal(out.length, 1);
-  assert.equal(out[0].type, 'image');
+  let out;
+  trackTmp(() => {
+    out = buildContent('', [
+      { name: 'p.png', type: 'image/png', size: 3, data },
+    ]);
+  });
+  assert.equal(typeof out, 'string');
+  assert.match(out, /^\(attachment\)/);
+  assert.match(out, /\[attachments: \/tmp\/discord-\d+-p\.png/);
 });
 
 test('mixed: text + image + non-image + failed all combine correctly', () => {
@@ -179,13 +168,10 @@ test('mixed: text + image + non-image + failed all combine correctly', () => {
       { name: 'c.png', type: 'image/png', size: 0, error: 'HTTP 404' },
     ]);
   });
-  assert.ok(Array.isArray(out));
-  assert.equal(out[0].type, 'text');
-  assert.match(out[0].text, /^hello/);
-  assert.match(out[0].text, /\[attachments: \/tmp\/discord-\d+-b\.pdf/);
-  assert.match(out[0].text, /\[failed: c\.png \(failed: HTTP 404\)\]/);
-  assert.equal(out[1].type, 'image');
-  assert.equal(out[1].source.media_type, 'image/png');
+  assert.equal(typeof out, 'string');
+  assert.match(out, /^hello/);
+  assert.match(out, /\[attachments: \/tmp\/discord-\d+-a\.png \(image\/png, 1b\), \/tmp\/discord-\d+-b\.pdf \(application\/pdf, 1b\)\]/);
+  assert.match(out, /\[failed: c\.png \(failed: HTTP 404\)\]/);
 });
 
 test('attachment with data but no type is treated as non-image', () => {
