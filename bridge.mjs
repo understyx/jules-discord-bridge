@@ -598,7 +598,7 @@ async function handleNewTask(msg, repo, baseText, attachments) {
     // Create a placeholder Discord channel. We don't have a session ID yet —
     // agent.send() will create the session using the user's message as the
     // initial prompt and we'll rename the channel once we have the ID.
-    const tempName = sanitizeChannelName(`task-pending-${Date.now().toString().slice(-8)}`);
+    const tempName = sanitizeChannelName(`task-pending-${Date.now().toString().slice(-8)}-${Math.random().toString(36).slice(2, 6)}`);
     const ch = await managedGuild.channels.create({
       name: tempName,
       type: ChannelType.GuildText,
@@ -625,7 +625,7 @@ async function handleNewTask(msg, repo, baseText, attachments) {
         console.error(`[new-task] channel rename failed: ${err.message}`);
       });
       managedSessions.set(sessionId, { channelId: ch.id, repo, state: 'created' });
-      // sessions.set was already called by agent.send() internally
+      // sessions.set was already called by agent.send() when creating the new session.
       saveState();
       console.log(`[new-task] ${repo} → session ${sessionId} → #${chName} (${ch.id})`);
     }
