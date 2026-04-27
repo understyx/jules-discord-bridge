@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
-import { IMAGE_MIME, buildContent, splitMessage } from './lib.mjs';
+import { IMAGE_MIME, buildContent, splitMessage, formatArtifacts, formatPlan } from './lib.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -139,6 +139,9 @@ class ChannelAgent {
     this.lastActivity = Date.now();
     this._idleTimer = null;
     this.session = null;
+    // Plan-approval state: set when the Jules session pauses for approval.
+    this.awaitingApproval = false;
+    this.pendingPlan = null;
     this._scheduleIdleClose();
   }
 
@@ -161,7 +164,56 @@ class ChannelAgent {
     this._idleTimer = t;
   }
 
-  async send(content, systemPrompt = 'You are a helpful coding agent.') {
+  /**
+   * Collect activities from `session.updates()` until the session completes or
+   * pauses for plan approval.  Returns an object describing the outcome.
+   *
+   * @returns {Promise<{text:string, artifacts:Array, awaitingApproval:boolean, plan:object|null}>}
+   */
+  async _collectStream() {
+    const messages = [];
+    const artifacts = [];
+
+    for await (const activity of this.session.updates()) {
+      if (activity.type === 'agentMessaged') {
+        messages.push(activity.message);
+      }
+
+      if (activity.type === 'planGenerated') {
+        // Ask the session whether it needs human approval before proceeding.
+        const info = await this.session.info();
+        if (info.state === 'awaitingPlanApproval') {
+          this.awaitingApproval = true;
+          this.pendingPlan = activity.plan;
+          return {
+            text: messages.join('\n\n'),
+            artifacts,
+            awaitingApproval: true,
+            plan: activity.plan,
+          };
+        }
+      }
+
+      for (const artifact of activity.artifacts || []) {
+        artifacts.push(artifact);
+      }
+
+      if (activity.type === 'sessionCompleted') {
+        break;
+      }
+    }
+
+    return { text: messages.join('\n\n'), artifacts, awaitingApproval: false, plan: null };
+  }
+
+  /**
+   * Send a user message to the Jules session and stream the response.
+   *
+   * @param {string|Array} content  Formatted message content.
+   * @param {string} systemPrompt   Used only when creating a brand-new session.
+   * @param {object|null} source    Jules source object (e.g. `{ github: 'org/repo', baseBranch: 'main' }`).
+   */
+  async send(content, systemPrompt = 'You are a helpful coding agent.', source = null) {
     if (this.closed) throw new Error('agent closed');
     if (this.pendingResolve) throw new Error('agent busy with previous turn');
     this._touch();
@@ -174,16 +226,20 @@ class ChannelAgent {
         if (this.sessionId && !this.session) {
           this.session = julesClient.session(this.sessionId);
         } else if (!this.session) {
-          this.session = await julesClient.session({ prompt: systemPrompt });
+          const opts = { prompt: systemPrompt };
+          if (source) opts.source = source;
+          this.session = await julesClient.session(opts);
           this.sessionId = this.session.id;
           sessions.set(this.channelId, this.sessionId);
           saveState();
-          console.log(`[${this.channelId}] session=${this.sessionId}`);
+          console.log(`[${this.channelId}] session=${this.sessionId}${source ? ` source=${JSON.stringify(source)}` : ''}`);
         }
 
-        const reply = await this.session.ask(content);
+        // Fire-and-forget the user message, then stream the agent's activities.
+        await this.session.send(content);
+        const result = await this._collectStream();
         this.pendingResolve = null;
-        return { text: reply.message };
+        return result;
       } catch (err) {
         const is404 = err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
         if (is404 && attempt === 1) {
@@ -198,8 +254,33 @@ class ChannelAgent {
 
         this.pendingResolve = null;
         console.error(`[${this.channelId}] stream error: ${err.message}`);
-        return { text: '', error: err.message };
+        return { text: '', artifacts: [], awaitingApproval: false, plan: null, error: err.message };
       }
+    }
+  }
+
+  /**
+   * Approve a pending Jules plan and stream the agent's subsequent activities.
+   * Only valid when `this.awaitingApproval` is true.
+   *
+   * @returns {Promise<{text:string, artifacts:Array, awaitingApproval:boolean, plan:object|null}>}
+   */
+  async approve() {
+    if (!this.awaitingApproval) throw new Error('no plan awaiting approval');
+    if (this.pendingResolve) throw new Error('agent busy');
+    this._touch();
+    this.pendingResolve = true;
+    try {
+      await this.session.approve();
+      this.awaitingApproval = false;
+      this.pendingPlan = null;
+      const result = await this._collectStream();
+      this.pendingResolve = null;
+      return result;
+    } catch (err) {
+      this.pendingResolve = null;
+      console.error(`[${this.channelId}] approve error: ${err.message}`);
+      return { text: '', artifacts: [], awaitingApproval: false, plan: null, error: err.message };
     }
   }
 
@@ -262,6 +343,7 @@ async function processQueue(channelId) {
     const attachments = await fetchAttachments(msg);
     if (!baseText && attachments.length === 0) continue;
 
+    // ----- special commands -----
     if (baseText === '!!clear') {
       const a = agents.get(channelId);
       if (a) { a.close(); agents.delete(channelId); }
@@ -273,11 +355,75 @@ async function processQueue(channelId) {
       continue;
     }
 
+    if (baseText === '!!approve') {
+      const a = agents.get(channelId);
+      if (!a || !a.awaitingApproval) {
+        await msg.reply('There is no plan awaiting approval in this channel.').catch(() => {});
+        continue;
+      }
+      try {
+        await msg.channel.sendTyping().catch(() => {});
+        const typingTimer = setInterval(() => msg.channel.sendTyping().catch(() => {}), 8000);
+        const t0 = Date.now();
+        const result = await a.approve();
+        clearInterval(typingTimer);
+        console.log(`[${channelId}] approved, turn ${(turnCounts.get(channelId) ?? 0) + 1} done in ${Date.now() - t0}ms`);
+        await _handleTurnResult(msg, channelId, result);
+      } catch (err) {
+        console.error(`[${channelId}] approve error: ${err.message}`);
+        await msg.reply(`Error during approval: ${err.message}`).catch(() => {});
+      }
+      continue;
+    }
+
+    if (baseText === '!!sources') {
+      try {
+        const lines = [];
+        for await (const source of julesClient.sources()) {
+          if (source.type === 'githubRepo') {
+            const { owner, repo, isPrivate } = source.githubRepo;
+            lines.push(`• **${owner}/${repo}**${isPrivate ? ' 🔒' : ''}`);
+          } else {
+            lines.push(`• ${source.type} (id: ${source.id})`);
+          }
+        }
+        const text = lines.length
+          ? `**Connected Jules sources:**\n${lines.join('\n')}`
+          : 'No connected sources found.';
+        await msg.reply(text).catch(() => {});
+      } catch (err) {
+        await msg.reply(`Error listing sources: ${err.message}`).catch(() => {});
+      }
+      continue;
+    }
+
+    if (baseText === '!!sessions') {
+      try {
+        const recent = await julesClient.select({
+          from: 'sessions',
+          order: 'desc',
+          limit: 5,
+        });
+        if (!recent || recent.length === 0) {
+          await msg.reply('No cached sessions found.').catch(() => {});
+        } else {
+          const lines = recent.map((s) => `• \`${s.id}\` — **${s.state}**`);
+          await msg.reply(`**Recent Jules sessions:**\n${lines.join('\n')}`).catch(() => {});
+        }
+      } catch (err) {
+        await msg.reply(`Error querying sessions: ${err.message}`).catch(() => {});
+      }
+      continue;
+    }
+
+    // ----- normal turn -----
     const content = buildContent(baseText, attachments);
     if (!content) continue;
 
     const access = loadAccess();
-    const systemPrompt = access.groups?.[channelId]?.systemPrompt;
+    const group = access.groups?.[channelId] || {};
+    const systemPrompt = group.systemPrompt;
+    const source = group.source || null;
 
     try {
       await msg.channel.sendTyping().catch(() => {});
@@ -285,23 +431,13 @@ async function processQueue(channelId) {
 
       const agent = getAgent(channelId);
       const t0 = Date.now();
-      console.log(`[${channelId}] send: ${typeof content === 'string' ? content.slice(0,80) : `[${content.length} blocks]`}`);
+      console.log(`[${channelId}] send: ${typeof content === 'string' ? content.slice(0, 80) : `[${content.length} blocks]`}`);
 
-      const result = await agent.send(content, systemPrompt);
+      const result = await agent.send(content, systemPrompt, source);
       clearInterval(typingTimer);
       console.log(`[${channelId}] turn ${(turnCounts.get(channelId) ?? 0) + 1} done in ${Date.now() - t0}ms`);
 
-      turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
-      saveState();
-
-      const text = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
-      const chunks = splitMessage(text);
-      const barEmbed = buildContextEmbed(channelId);
-      for (let i = 0; i < chunks.length; i++) {
-        const isLast = i === chunks.length - 1;
-        if (isLast) await msg.reply({ content: chunks[i], embeds: [barEmbed] });
-        else await msg.reply(chunks[i]);
-      }
+      await _handleTurnResult(msg, channelId, result);
     } catch (err) {
       console.error(`[${channelId}] error: ${err.message}`);
       await msg.reply(`Error: ${err.message}`).catch(() => {});
@@ -309,6 +445,45 @@ async function processQueue(channelId) {
   }
 
   channelBusy.set(channelId, false);
+}
+
+/**
+ * Send the result of a Jules turn (or approval) back to Discord.
+ * Handles plan-approval pauses, artifact formatting, and message splitting.
+ *
+ * @param {import('discord.js').Message} msg
+ * @param {string} channelId
+ * @param {{text:string, artifacts:Array, awaitingApproval:boolean, plan:object|null, error?:string}} result
+ */
+async function _handleTurnResult(msg, channelId, result) {
+  if (result.awaitingApproval) {
+    // Jules generated a plan and is waiting for human approval.
+    const planText = formatPlan(result.plan);
+    const preText = result.text ? `${result.text}\n\n` : '';
+    await msg
+      .reply(
+        `${preText}**Jules has generated a plan and is waiting for your approval:**\n${planText}\n\n` +
+          'Reply with `!!approve` to proceed, or `!!clear` to cancel.'
+      )
+      .catch(() => {});
+    return;
+  }
+
+  // Increment turn count only for completed turns.
+  turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
+  saveState();
+
+  const mainText = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
+  const artifactText = formatArtifacts(result.artifacts || []);
+  const fullText = artifactText ? `${mainText}\n\n${artifactText}` : mainText;
+
+  const chunks = splitMessage(fullText);
+  const barEmbed = buildContextEmbed(channelId);
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    if (isLast) await msg.reply({ content: chunks[i], embeds: [barEmbed] });
+    else await msg.reply(chunks[i]);
+  }
 }
 
 // ----- discord client -----

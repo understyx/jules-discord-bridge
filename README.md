@@ -82,24 +82,57 @@ buildContent(text, attachments)
    ↓
 getAgent(channelId)  ← reuse the persistent ChannelAgent
    ↓
-agent.send(content)  ← sends message to jules.session()
+agent.send(content, systemPrompt, source)
    ↓
-jules SDK uses Jules API
+session.send(content) + session.updates() stream
    ↓
-receives response
+Jules SDK uses Jules API
+   ↓
+receives agentMessaged / planGenerated / artifacts / sessionCompleted activities
+   ↓
+_handleTurnResult()  ← formats text + artifacts, handles plan approval pause
    ↓
 msg.reply(text) + turn count embed
 ```
 
 Each channel gets one `ChannelAgent` instance, which keeps a Jules session active.
 
+### Streaming and artifacts
+
+Every turn now uses `session.send()` + `session.updates()` (reactive stream) instead of the blocking `session.ask()`. This lets the bridge:
+
+- Detect plan-approval pauses (`planGenerated` + `awaitingPlanApproval` state) and show the plan to users before the agent starts executing.
+- Surface `bashOutput` artifacts as fenced code blocks in the Discord reply.
+- Surface `changeSet` artifacts as a per-file diff summary (`path: +N -M`).
+- Note `media` artifacts inline so users know something was generated.
+
+### GitHub source per channel
+
+Each channel entry in `access.json` can carry an optional `source` field that is forwarded to `jules.session()` when a new session is created.  Sessions linked to a repository can read and modify the repo's code, and they will pause for plan approval before making changes.
+
+```json
+"source": { "github": "your-org/your-repo", "baseBranch": "main" }
+```
+
+### Plan approval flow
+
+When Jules finishes analyzing a repository and presents a plan:
+
+1. The bridge sends the numbered plan to Discord and instructs the user to reply with `!!approve`.
+2. Sending `!!approve` calls `session.approve()` and resumes the stream — the agent executes the plan and the result (with any diff artifacts) is sent back.
+3. Sending `!!clear` discards the session entirely.
+
+
 ### Session storage
 
 Across restarts, `state/sessions.json` (in the bridge directory) is the pointer file mapping each channel to its session ID. When the bridge wakes, it reads this map and calls `jules.session(sessionId)`.
 
-### Special commands
+## Special commands
 
 - `!!clear` in any allowed channel — closes the agent for that channel, drops the session pointer and turn count, recreates fresh on the next message.
+- `!!approve` — when Jules has generated a plan and is waiting for your approval, send this command to approve it and let the agent proceed.
+- `!!sources` — list all GitHub repositories (and other sources) connected to your Jules account.
+- `!!sessions` — show the five most recent Jules sessions cached locally, with their states.
 
 ---
 
@@ -123,7 +156,12 @@ Across restarts, `state/sessions.json` (in the bridge directory) is the pointer 
   "groups": {
     "<channelId>": {
       "allowFrom": ["<userId>", ...],   // optional whitelist; omit to allow anyone in the channel
-      "requireMention": true             // if true, only respond when @mentioned or replied-to
+      "requireMention": true,            // if true, only respond when @mentioned or replied-to
+      "systemPrompt": "...",             // optional system prompt for new sessions
+      "source": {                        // optional Jules source — links sessions to a GitHub repo
+        "github": "owner/repo",
+        "baseBranch": "main"
+      }
     }
   }
 }

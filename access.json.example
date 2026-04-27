@@ -16,6 +16,16 @@
     "5555555555555555555": {
       "_comment": "Open channel — anyone in the channel can talk to the bot. Be careful: this gives them shell access on the host (see SECURITY in README).",
       "requireMention": true
+    },
+    "4444444444444444444": {
+      "_comment": "Repo-linked channel — Jules sessions are created with a GitHub source so the agent can read and modify the repository. Plan approval is required before execution.",
+      "allowFrom": ["111111111111111111"],
+      "requireMention": false,
+      "systemPrompt": "You are a helpful coding agent working on this repository.",
+      "source": {
+        "github": "your-org/your-repo",
+        "baseBranch": "main"
+      }
     }
   }
 }

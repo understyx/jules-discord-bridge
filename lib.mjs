@@ -7,6 +7,63 @@ import fs from 'node:fs';
 
 export const IMAGE_MIME = /^image\/(png|jpe?g|gif|webp)$/i;
 
+// Max characters shown per bash artifact in a Discord reply.
+const BASH_ARTIFACT_MAX = 1400;
+
+/**
+ * Format a plan object (from a `planGenerated` activity) into a human-readable
+ * numbered list suitable for a Discord message.
+ *
+ * @param {object|null} plan - Jules plan object with a `steps` array.
+ * @returns {string}
+ */
+export function formatPlan(plan) {
+  if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
+    return '*(no plan details)*';
+  }
+  return plan.steps.map((s, i) => `${i + 1}. ${s.title}`).join('\n');
+}
+
+/**
+ * Format an array of Jules activity artifacts into a Discord-ready string.
+ * Handles `bashOutput` (code block) and `changeSet` (diff summary).
+ * Media artifacts are noted but not embedded.
+ *
+ * @param {Array} artifacts
+ * @returns {string} May be empty string if there are no displayable artifacts.
+ */
+export function formatArtifacts(artifacts) {
+  if (!artifacts || artifacts.length === 0) return '';
+  const parts = [];
+  for (const artifact of artifacts) {
+    try {
+      if (artifact.type === 'bashOutput') {
+        const raw = artifact.toString();
+        if (raw && raw.trim()) {
+          const truncated =
+            raw.length > BASH_ARTIFACT_MAX
+              ? raw.slice(0, BASH_ARTIFACT_MAX) + '\n…(truncated)'
+              : raw;
+          parts.push(`\`\`\`\n${truncated}\n\`\`\``);
+        }
+      } else if (artifact.type === 'changeSet') {
+        const parsed = artifact.parsed();
+        if (parsed && parsed.files && parsed.files.length > 0) {
+          const lines = parsed.files.map(
+            (f) => `\`${f.path}\`: +${f.additions} -${f.deletions}`
+          );
+          parts.push(`**Changes:**\n${lines.join('\n')}`);
+        }
+      } else if (artifact.type === 'media') {
+        parts.push(`*(media: ${artifact.format ?? 'unknown format'})*`);
+      }
+    } catch {
+      // skip malformed artifacts
+    }
+  }
+  return parts.join('\n\n');
+}
+
 export function buildContent(text, attachments) {
   let contentText = text || '';
 
