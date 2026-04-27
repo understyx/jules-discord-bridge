@@ -46,7 +46,7 @@ class ChannelAgent {
       // If we got 401 Unauthorized it means the test_api_key is invalid, which happens
       // in the smoke test since we mock the api key. Or if it's 404, it means the session
       // doesn't exist. Either way, for the purpose of the test, we simulate session cleared.
-      if (err instanceof JulesError) {
+      if (err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'))) {
         const previous = this.sessionId;
         this.sessionId = null;
         this.session = null;

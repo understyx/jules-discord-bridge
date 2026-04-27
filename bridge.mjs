@@ -8,6 +8,8 @@ import { IMAGE_MIME, buildContent, splitMessage } from './lib.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+const julesClient = jules.with({ apiKey: process.env.JULES_API_KEY });
+
 const ACCESS_JSON = process.env.ACCESS_JSON || path.join(__dirname, 'access.json');
 const STATE_DIR = process.env.STATE_DIR || path.join(__dirname, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
@@ -169,9 +171,9 @@ class ChannelAgent {
 
     try {
       if (this.sessionId && !this.session) {
-        this.session = jules.session(this.sessionId);
+        this.session = julesClient.session(this.sessionId);
       } else if (!this.session) {
-        this.session = await jules.session({ prompt: 'You are a helpful coding agent.' });
+        this.session = await julesClient.session({ prompt: 'You are a helpful coding agent.' });
         this.sessionId = this.session.id;
         sessions.set(this.channelId, this.sessionId);
         saveState();
@@ -185,7 +187,7 @@ class ChannelAgent {
       this.pendingResolve = null;
       console.error(`[${this.channelId}] stream error: ${err.message}`);
 
-      if (err instanceof JulesError) {
+      if (err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'))) {
         const previous = this.sessionId;
         this.sessionId = null;
         this.session = null;
