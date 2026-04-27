@@ -67,7 +67,11 @@ function loadState() {
     const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     for (const [k, v] of Object.entries(data.sessions || {})) sessions.set(k, v);
     for (const [k, v] of Object.entries(data.turns || {})) turnCounts.set(k, v);
-    for (const [k, v] of Object.entries(data.managedSessions || {})) managedSessions.set(k, v);
+    for (const [k, v] of Object.entries(data.managedSessions || {})) {
+      // Inflate the postedActivityIds array into a Set for fast O(1) lookup.
+      v.postedActivityIds = new Set(v.postedActivityIds || []);
+      managedSessions.set(k, v);
+    }
     for (const [k, v] of Object.entries(data.managedCategories || {})) managedCategories.set(k, v);
     for (const [k, v] of Object.entries(data.newTaskChannels || {})) newTaskChannels.set(k, v);
     // Rebuild the channelId → sessionId map from managed sessions so that
@@ -86,10 +90,20 @@ function saveState() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
+
+    // Convert postedActivityIds Sets back to Arrays for JSON serialization.
+    const managedSessionsJson = {};
+    for (const [sessionId, info] of managedSessions) {
+      managedSessionsJson[sessionId] = {
+        ...info,
+        postedActivityIds: Array.from(info.postedActivityIds || []),
+      };
+    }
+
     const data = {
       sessions: Object.fromEntries(sessions),
       turns: Object.fromEntries(turnCounts),
-      managedSessions: Object.fromEntries(managedSessions),
+      managedSessions: managedSessionsJson,
       managedCategories: Object.fromEntries(managedCategories),
       newTaskChannels: Object.fromEntries(newTaskChannels),
     };
@@ -182,6 +196,50 @@ async function fetchAttachments(msg) {
 
 // ----- per-channel agent -----
 
+/**
+ * Relay a single Jules activity to a Discord channel.
+ * Deduplicates using the session's `postedActivityIds` set.
+ *
+ * @param {import('discord.js').TextChannel} ch
+ * @param {string} sessionId
+ * @param {object} activity
+ */
+async function relayActivity(ch, sessionId, activity) {
+  const managed = managedSessions.get(sessionId);
+  if (!managed) return;
+
+  // Deduplicate: if we've already posted this activity ID, skip it.
+  if (activity.id && managed.postedActivityIds.has(activity.id)) return;
+
+  let textToPost = null;
+
+  if (activity.type === 'agentMessaged') {
+    textToPost = activity.message;
+  } else if (activity.type === 'planGenerated') {
+    const planText = formatPlan(activity.plan);
+    textToPost = `**Jules has generated a plan and is waiting for your approval:**\n${planText}\n\n` +
+                 'Reply with `!!approve` to proceed, or `!!clear` to cancel.';
+  }
+
+  const artifacts = activity.artifacts || [];
+  const artifactText = formatArtifacts(artifacts);
+
+  if (textToPost || artifactText) {
+    const fullText = [textToPost, artifactText].filter(Boolean).join('\n\n');
+    const chunks = splitMessage(fullText);
+    for (const chunk of chunks) {
+      await ch.send(chunk).catch((err) => {
+        console.error(`[relay] send failed for ${sessionId}: ${err.message}`);
+      });
+    }
+
+    if (activity.id) {
+      managed.postedActivityIds.add(activity.id);
+      saveState();
+    }
+  }
+}
+
 /** Returns true when `err` represents an HTTP 404 from the Jules API. */
 function is404Error(err) {
   return err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
@@ -229,31 +287,20 @@ class ChannelAgent {
    * @returns {Promise<{text:string, artifacts:Array, awaitingApproval:boolean, plan:object|null}>}
    */
   async _collectStream() {
-    const messages = [];
-    const artifacts = [];
+    const ch = managedGuild?.channels.cache.get(this.channelId);
 
     for await (const activity of this.session.updates()) {
-      if (activity.type === 'agentMessaged') {
-        messages.push(activity.message);
+      if (ch && this.sessionId) {
+        await relayActivity(ch, this.sessionId, activity);
       }
 
       if (activity.type === 'planGenerated') {
-        // Ask the session whether it needs human approval before proceeding.
         const info = await this.session.info();
         if (info.state === 'awaitingPlanApproval') {
           this.awaitingApproval = true;
           this.pendingPlan = activity.plan;
-          return {
-            text: messages.join('\n\n'),
-            artifacts,
-            awaitingApproval: true,
-            plan: activity.plan,
-          };
+          return { awaitingApproval: true, plan: activity.plan };
         }
-      }
-
-      for (const artifact of activity.artifacts || []) {
-        artifacts.push(artifact);
       }
 
       if (activity.type === 'sessionCompleted') {
@@ -261,7 +308,7 @@ class ChannelAgent {
       }
     }
 
-    return { text: messages.join('\n\n'), artifacts, awaitingApproval: false, plan: null };
+    return { awaitingApproval: false, plan: null };
   }
 
   /**
@@ -355,12 +402,12 @@ class ChannelAgent {
           }
           this.pendingResolve = null;
           console.error(`[${this.channelId}] stream error after retries: ${lastErr.message}`);
-          return { text: '', artifacts: [], awaitingApproval: false, plan: null, error: lastErr.message };
+          return { awaitingApproval: false, plan: null, error: lastErr.message };
         }
 
         this.pendingResolve = null;
         console.error(`[${this.channelId}] stream error: ${err.message}`);
-        return { text: '', artifacts: [], awaitingApproval: false, plan: null, error: err.message };
+        return { awaitingApproval: false, plan: null, error: err.message };
       }
     }
   }
@@ -386,7 +433,7 @@ class ChannelAgent {
     } catch (err) {
       this.pendingResolve = null;
       console.error(`[${this.channelId}] approve error: ${err.message}`);
-      return { text: '', artifacts: [], awaitingApproval: false, plan: null, error: err.message };
+      return { awaitingApproval: false, plan: null, error: err.message };
     }
   }
 
@@ -477,17 +524,15 @@ const TERMINAL_STATES = new Set(['completed', 'failed']);
 
 /**
  * Fetch all past activities for a Jules session via `session.history()` and
- * post any `agentMessaged` content to the associated Discord channel.
+ * relay any new ones to Discord using `relayActivity`.
  *
- * Called during sync when a session has reached a terminal state but the
- * bridge never successfully relayed its responses (e.g. the initial activity
- * stream failed with a 404 before Jules finished the task).
+ * This provides a robust "catch-up" mechanism for activities missed by the
+ * real-time `updates()` stream (e.g. due to bot restarts or network blips).
  */
 async function fetchAndPostHistory(guild, channelId, sessionId) {
   // Don't interfere if an agent is actively streaming this channel right now.
   const existingAgent = agents.get(channelId);
   if (existingAgent && existingAgent.pendingResolve) {
-    console.log(`[sync] skipping history fetch for ${sessionId} — agent is actively streaming`);
     return;
   }
 
@@ -495,45 +540,14 @@ async function fetchAndPostHistory(guild, channelId, sessionId) {
   if (!ch) return;
 
   const session = julesClient.session(sessionId);
-  const messages = [];
-  const artifacts = [];
 
   try {
     for await (const activity of session.history()) {
-      if (activity.type === 'agentMessaged') messages.push(activity.message);
-      for (const artifact of activity.artifacts || []) artifacts.push(artifact);
+      await relayActivity(ch, sessionId, activity);
     }
   } catch (err) {
     console.error(`[sync] history fetch failed for ${sessionId}: ${err.message}`);
-    return;
   }
-
-  if (messages.length === 0 && artifacts.length === 0) {
-    // Nothing to post — mark as done so we don't re-check every cycle.
-    if (managedSessions.has(sessionId)) {
-      managedSessions.get(sessionId).activitiesPosted = true;
-      saveState();
-    }
-    return;
-  }
-
-  const mainText = messages.join('\n\n');
-  const artifactText = formatArtifacts(artifacts);
-  const fullText = artifactText ? `${mainText}\n\n${artifactText}` : mainText;
-  const chunks = splitMessage(fullText);
-
-  for (const chunk of chunks) {
-    await ch.send(chunk).catch((err) => {
-      console.error(`[sync] history post failed for ${sessionId}: ${err.message}`);
-    });
-  }
-
-  turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
-  if (managedSessions.has(sessionId)) {
-    managedSessions.get(sessionId).activitiesPosted = true;
-  }
-  saveState();
-  console.log(`[sync] posted history for session ${sessionId} → ${channelId}`);
 }
 
 /**
@@ -575,19 +589,11 @@ async function syncOneSession(guild, session) {
       }
     }
 
-    // If the session is in a terminal state and the bridge has never
-    // successfully relayed its activities, fetch and post the history now.
-    // Two complementary checks prevent double-posting:
-    //   1. `activitiesPosted` — set explicitly after a successful relay.
-    //   2. `turnCounts > 0`  — backward-compat fallback for state files written
-    //      before `activitiesPosted` was introduced; a non-zero count means
-    //      at least one turn completed and was already posted.
-    const alreadyRelayed = managed.activitiesPosted || (turnCounts.get(managed.channelId) || 0) > 0;
-    if (TERMINAL_STATES.has(newState) && !alreadyRelayed) {
-      fetchAndPostHistory(guild, managed.channelId, sessionId).catch((err) => {
-        console.error(`[sync] fetchAndPostHistory error for ${sessionId}: ${err.message}`);
-      });
-    }
+    // Fetch history to catch up on any activities missed by the live stream.
+    // fetchAndPostHistory handles its own deduplication via relayActivity.
+    fetchAndPostHistory(guild, managed.channelId, sessionId).catch((err) => {
+      console.error(`[sync] fetchAndPostHistory error for ${sessionId}: ${err.message}`);
+    });
     return;
   }
 
@@ -633,17 +639,20 @@ async function syncOneSession(guild, session) {
         .catch(() => {});
     }
 
-    managedSessions.set(sessionId, { channelId: ch.id, repo: repo ?? null, state: newState, activitiesPosted: false });
+    managedSessions.set(sessionId, {
+      channelId: ch.id,
+      repo: repo ?? null,
+      state: newState,
+      postedActivityIds: new Set(),
+    });
     sessions.set(ch.id, sessionId);
     saveState();
     console.log(`[sync] session ${sessionId} → #${ch.name} (${ch.id})`);
 
-    // If the session is already terminal when first discovered, fetch history immediately.
-    if (TERMINAL_STATES.has(newState)) {
-      fetchAndPostHistory(guild, ch.id, sessionId).catch((err) => {
-        console.error(`[sync] fetchAndPostHistory error for ${sessionId}: ${err.message}`);
-      });
-    }
+    // Fetch history immediately to catch up on all past activities.
+    fetchAndPostHistory(guild, ch.id, sessionId).catch((err) => {
+      console.error(`[sync] fetchAndPostHistory error for ${sessionId}: ${err.message}`);
+    });
   } catch (err) {
     console.error(`[sync] failed for session ${sessionId}: ${err.message}`);
   }
@@ -767,42 +776,28 @@ async function handleNewTask(msg, repo, baseText, attachments) {
       await ch.edit({ name: chName, topic: `Jules session ${sessionId} — ${repo}` }).catch((err) => {
         console.error(`[new-task] channel rename failed: ${err.message}`);
       });
-      managedSessions.set(sessionId, { channelId: ch.id, repo, state: null });
+      managedSessions.set(sessionId, {
+        channelId: ch.id,
+        repo,
+        state: null,
+        postedActivityIds: new Set(),
+      });
       // sessions.set was already called by agent.send() when creating the new session.
       saveState();
       console.log(`[new-task] ${repo} → session ${sessionId} → #${chName} (${ch.id})`);
     }
 
-    if (result.awaitingApproval) {
-      const planText = formatPlan(result.plan);
-      const preText = result.text ? `${result.text}\n\n` : '';
-      await ch
-        .send(
-          `${preText}**Jules has generated a plan and is waiting for your approval:**\n${planText}\n\n` +
-            'Reply with `!!approve` to proceed, or `!!clear` to cancel.',
-        )
-        .catch(() => {});
-      return;
-    }
+    if (result.awaitingApproval) return;
 
     turnCounts.set(ch.id, (turnCounts.get(ch.id) || 0) + 1);
-
-    // Mark activities as relayed so the sync loop doesn't double-post.
-    const finalSessionId = agent.sessionId;
-    if (finalSessionId && managedSessions.has(finalSessionId)) {
-      managedSessions.get(finalSessionId).activitiesPosted = true;
-    }
     saveState();
 
-    const mainText = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
-    const artifactText = formatArtifacts(result.artifacts || []);
-    const fullText = artifactText ? `${mainText}\n\n${artifactText}` : mainText;
-    const chunks = splitMessage(fullText);
-    const barEmbed = buildContextEmbed(ch.id);
-    for (let i = 0; i < chunks.length; i++) {
-      if (i === chunks.length - 1) await ch.send({ content: chunks[i], embeds: [barEmbed] });
-      else await ch.send(chunks[i]);
+    if (result.error) {
+      await ch.send(`❌ **Error:** ${result.error}`).catch(() => {});
     }
+
+    const barEmbed = buildContextEmbed(ch.id);
+    await ch.send({ embeds: [barEmbed] }).catch(() => {});
   } catch (err) {
     console.error(`[new-task] ${repo}: ${err.message}`);
     await msg.reply(`Error creating session: ${err.message}`).catch(() => {});
@@ -985,40 +980,17 @@ async function processQueue(channelId) {
  * @param {{text:string, artifacts:Array, awaitingApproval:boolean, plan:object|null, error?:string}} result
  */
 async function _handleTurnResult(msg, channelId, result) {
-  if (result.awaitingApproval) {
-    // Jules generated a plan and is waiting for human approval.
-    const planText = formatPlan(result.plan);
-    const preText = result.text ? `${result.text}\n\n` : '';
-    await msg
-      .reply(
-        `${preText}**Jules has generated a plan and is waiting for your approval:**\n${planText}\n\n` +
-          'Reply with `!!approve` to proceed, or `!!clear` to cancel.'
-      )
-      .catch(() => {});
-    return;
-  }
+  if (result.awaitingApproval) return;
 
-  // Increment turn count only for completed turns.
   turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
-
-  // Mark activities as relayed so the sync loop doesn't double-post.
-  const sessionId = sessions.get(channelId);
-  if (sessionId && managedSessions.has(sessionId)) {
-    managedSessions.get(sessionId).activitiesPosted = true;
-  }
   saveState();
 
-  const mainText = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
-  const artifactText = formatArtifacts(result.artifacts || []);
-  const fullText = artifactText ? `${mainText}\n\n${artifactText}` : mainText;
-
-  const chunks = splitMessage(fullText);
-  const barEmbed = buildContextEmbed(channelId);
-  for (let i = 0; i < chunks.length; i++) {
-    const isLast = i === chunks.length - 1;
-    if (isLast) await msg.reply({ content: chunks[i], embeds: [barEmbed] });
-    else await msg.reply(chunks[i]);
+  if (result.error) {
+    await msg.reply(`❌ **Error:** ${result.error}`).catch(() => {});
   }
+
+  const barEmbed = buildContextEmbed(channelId);
+  await msg.reply({ embeds: [barEmbed] }).catch(() => {});
 }
 
 // ----- discord client -----
