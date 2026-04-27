@@ -181,6 +181,12 @@ async function fetchAttachments(msg) {
 }
 
 // ----- per-channel agent -----
+
+/** Returns true when `err` represents an HTTP 404 from the Jules API. */
+function is404Error(err) {
+  return err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
+}
+
 class ChannelAgent {
   constructor(channelId) {
     this.channelId = channelId;
@@ -312,7 +318,7 @@ class ChannelAgent {
         this.pendingResolve = null;
         return result;
       } catch (err) {
-        const is404 = err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
+        const is404 = is404Error(err);
         // Only retry with a fresh session when we were resuming a stored session
         // that Jules no longer recognises.  Do NOT retry when we just created a
         // new session this attempt — a 404 on a brand-new session's activity
@@ -343,7 +349,7 @@ class ChannelAgent {
               return result;
             } catch (retryErr) {
               lastErr = retryErr;
-              const retryIs404 = retryErr instanceof JulesError || retryErr.status === 404 || (retryErr.message && retryErr.message.includes('404'));
+              const retryIs404 = is404Error(retryErr);
               if (!retryIs404) break; // non-404 error — stop retrying
             }
           }
@@ -480,7 +486,10 @@ const TERMINAL_STATES = new Set(['completed', 'failed']);
 async function fetchAndPostHistory(guild, channelId, sessionId) {
   // Don't interfere if an agent is actively streaming this channel right now.
   const existingAgent = agents.get(channelId);
-  if (existingAgent && existingAgent.pendingResolve) return;
+  if (existingAgent && existingAgent.pendingResolve) {
+    console.log(`[sync] skipping history fetch for ${sessionId} — agent is actively streaming`);
+    return;
+  }
 
   const ch = guild.channels.cache.get(channelId);
   if (!ch) return;
@@ -568,8 +577,11 @@ async function syncOneSession(guild, session) {
 
     // If the session is in a terminal state and the bridge has never
     // successfully relayed its activities, fetch and post the history now.
-    // Use turnCounts as a fallback for sessions persisted before this flag
-    // was introduced (non-zero turns means the bridge already posted).
+    // Two complementary checks prevent double-posting:
+    //   1. `activitiesPosted` — set explicitly after a successful relay.
+    //   2. `turnCounts > 0`  — backward-compat fallback for state files written
+    //      before `activitiesPosted` was introduced; a non-zero count means
+    //      at least one turn completed and was already posted.
     const alreadyRelayed = managed.activitiesPosted || (turnCounts.get(managed.channelId) || 0) > 0;
     if (TERMINAL_STATES.has(newState) && !alreadyRelayed) {
       fetchAndPostHistory(guild, managed.channelId, sessionId).catch((err) => {
