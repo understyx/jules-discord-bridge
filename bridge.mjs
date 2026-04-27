@@ -181,6 +181,12 @@ async function fetchAttachments(msg) {
 }
 
 // ----- per-channel agent -----
+
+/** Returns true when `err` represents an HTTP 404 from the Jules API. */
+function is404Error(err) {
+  return err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
+}
+
 class ChannelAgent {
   constructor(channelId) {
     this.channelId = channelId;
@@ -312,7 +318,7 @@ class ChannelAgent {
         this.pendingResolve = null;
         return result;
       } catch (err) {
-        const is404 = err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
+        const is404 = is404Error(err);
         // Only retry with a fresh session when we were resuming a stored session
         // that Jules no longer recognises.  Do NOT retry when we just created a
         // new session this attempt — a 404 on a brand-new session's activity
@@ -327,6 +333,29 @@ class ChannelAgent {
           sessions.delete(this.channelId);
           saveState();
           continue; // retry
+        }
+
+        // Brand-new session whose activities endpoint isn't ready yet.
+        // Retry _collectStream() with backoff — don't create a new session.
+        if (is404 && !resumingSession) {
+          const retryDelays = [5_000, 15_000, 30_000];
+          let lastErr = err;
+          for (const delay of retryDelays) {
+            console.warn(`[${this.channelId}] new session ${this.sessionId} not yet ready (404) — retrying stream in ${delay / 1000}s`);
+            await new Promise((r) => setTimeout(r, delay));
+            try {
+              const result = await this._collectStream();
+              this.pendingResolve = null;
+              return result;
+            } catch (retryErr) {
+              lastErr = retryErr;
+              const retryIs404 = is404Error(retryErr);
+              if (!retryIs404) break; // non-404 error — stop retrying
+            }
+          }
+          this.pendingResolve = null;
+          console.error(`[${this.channelId}] stream error after retries: ${lastErr.message}`);
+          return { text: '', artifacts: [], awaitingApproval: false, plan: null, error: lastErr.message };
         }
 
         this.pendingResolve = null;
@@ -442,6 +471,71 @@ async function ensureNewTaskChannel(guild, repo) {
   }
 }
 
+// Terminal session states where Jules has finished working and may have
+// responses that the bridge never relayed (e.g. due to a stream error).
+const TERMINAL_STATES = new Set(['completed', 'failed']);
+
+/**
+ * Fetch all past activities for a Jules session via `session.history()` and
+ * post any `agentMessaged` content to the associated Discord channel.
+ *
+ * Called during sync when a session has reached a terminal state but the
+ * bridge never successfully relayed its responses (e.g. the initial activity
+ * stream failed with a 404 before Jules finished the task).
+ */
+async function fetchAndPostHistory(guild, channelId, sessionId) {
+  // Don't interfere if an agent is actively streaming this channel right now.
+  const existingAgent = agents.get(channelId);
+  if (existingAgent && existingAgent.pendingResolve) {
+    console.log(`[sync] skipping history fetch for ${sessionId} — agent is actively streaming`);
+    return;
+  }
+
+  const ch = guild.channels.cache.get(channelId);
+  if (!ch) return;
+
+  const session = julesClient.session(sessionId);
+  const messages = [];
+  const artifacts = [];
+
+  try {
+    for await (const activity of session.history()) {
+      if (activity.type === 'agentMessaged') messages.push(activity.message);
+      for (const artifact of activity.artifacts || []) artifacts.push(artifact);
+    }
+  } catch (err) {
+    console.error(`[sync] history fetch failed for ${sessionId}: ${err.message}`);
+    return;
+  }
+
+  if (messages.length === 0 && artifacts.length === 0) {
+    // Nothing to post — mark as done so we don't re-check every cycle.
+    if (managedSessions.has(sessionId)) {
+      managedSessions.get(sessionId).activitiesPosted = true;
+      saveState();
+    }
+    return;
+  }
+
+  const mainText = messages.join('\n\n');
+  const artifactText = formatArtifacts(artifacts);
+  const fullText = artifactText ? `${mainText}\n\n${artifactText}` : mainText;
+  const chunks = splitMessage(fullText);
+
+  for (const chunk of chunks) {
+    await ch.send(chunk).catch((err) => {
+      console.error(`[sync] history post failed for ${sessionId}: ${err.message}`);
+    });
+  }
+
+  turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
+  if (managedSessions.has(sessionId)) {
+    managedSessions.get(sessionId).activitiesPosted = true;
+  }
+  saveState();
+  console.log(`[sync] posted history for session ${sessionId} → ${channelId}`);
+}
+
 /**
  * Reconcile a single Jules session with Discord:
  *   - If we already track it and its state changed, post a notification.
@@ -479,6 +573,20 @@ async function syncOneSession(guild, session) {
           console.error(`[sync] status update error for ${sessionId}: ${err.message}`);
         }
       }
+    }
+
+    // If the session is in a terminal state and the bridge has never
+    // successfully relayed its activities, fetch and post the history now.
+    // Two complementary checks prevent double-posting:
+    //   1. `activitiesPosted` — set explicitly after a successful relay.
+    //   2. `turnCounts > 0`  — backward-compat fallback for state files written
+    //      before `activitiesPosted` was introduced; a non-zero count means
+    //      at least one turn completed and was already posted.
+    const alreadyRelayed = managed.activitiesPosted || (turnCounts.get(managed.channelId) || 0) > 0;
+    if (TERMINAL_STATES.has(newState) && !alreadyRelayed) {
+      fetchAndPostHistory(guild, managed.channelId, sessionId).catch((err) => {
+        console.error(`[sync] fetchAndPostHistory error for ${sessionId}: ${err.message}`);
+      });
     }
     return;
   }
@@ -525,10 +633,17 @@ async function syncOneSession(guild, session) {
         .catch(() => {});
     }
 
-    managedSessions.set(sessionId, { channelId: ch.id, repo: repo ?? null, state: newState });
+    managedSessions.set(sessionId, { channelId: ch.id, repo: repo ?? null, state: newState, activitiesPosted: false });
     sessions.set(ch.id, sessionId);
     saveState();
     console.log(`[sync] session ${sessionId} → #${ch.name} (${ch.id})`);
+
+    // If the session is already terminal when first discovered, fetch history immediately.
+    if (TERMINAL_STATES.has(newState)) {
+      fetchAndPostHistory(guild, ch.id, sessionId).catch((err) => {
+        console.error(`[sync] fetchAndPostHistory error for ${sessionId}: ${err.message}`);
+      });
+    }
   } catch (err) {
     console.error(`[sync] failed for session ${sessionId}: ${err.message}`);
   }
@@ -671,6 +786,12 @@ async function handleNewTask(msg, repo, baseText, attachments) {
     }
 
     turnCounts.set(ch.id, (turnCounts.get(ch.id) || 0) + 1);
+
+    // Mark activities as relayed so the sync loop doesn't double-post.
+    const finalSessionId = agent.sessionId;
+    if (finalSessionId && managedSessions.has(finalSessionId)) {
+      managedSessions.get(finalSessionId).activitiesPosted = true;
+    }
     saveState();
 
     const mainText = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
@@ -879,6 +1000,12 @@ async function _handleTurnResult(msg, channelId, result) {
 
   // Increment turn count only for completed turns.
   turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
+
+  // Mark activities as relayed so the sync loop doesn't double-post.
+  const sessionId = sessions.get(channelId);
+  if (sessionId && managedSessions.has(sessionId)) {
+    managedSessions.get(sessionId).activitiesPosted = true;
+  }
   saveState();
 
   const mainText = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
