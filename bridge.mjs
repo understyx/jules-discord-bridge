@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, Partials, EmbedBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, EmbedBuilder, ChannelType } from 'discord.js';
 import { jules, JulesError } from '@google/jules-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
