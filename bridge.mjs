@@ -277,10 +277,18 @@ class ChannelAgent {
     this.pendingResolve = true;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
+      // Track whether this attempt is resuming a pre-existing session.  The
+      // stale-session retry only makes sense when we tried to reattach to a
+      // session that Jules no longer knows about.  If we *just* created a
+      // brand-new session this attempt, a 404 on the activity stream is an
+      // API error — creating yet another session won't help and leads to
+      // duplicate sessions that confuse the next sync cycle.
+      let resumingSession = false;
       try {
         if (!this.session) {
           if (this.sessionId) {
             // Resume an existing session — send the new message to it.
+            resumingSession = true;
             this.session = julesClient.session(this.sessionId);
             await this.session.send(content);
           } else {
@@ -296,6 +304,7 @@ class ChannelAgent {
           }
         } else {
           // Session object already loaded — this is a follow-up turn.
+          resumingSession = true;
           await this.session.send(content);
         }
 
@@ -304,7 +313,13 @@ class ChannelAgent {
         return result;
       } catch (err) {
         const is404 = err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
-        if (is404 && attempt === 1) {
+        // Only retry with a fresh session when we were resuming a stored session
+        // that Jules no longer recognises.  Do NOT retry when we just created a
+        // new session this attempt — a 404 on a brand-new session's activity
+        // stream is a transient API error; creating a second session would leave
+        // an orphaned session on the Jules side that the next sync would then
+        // pick up and re-map to a duplicate Discord channel.
+        if (is404 && attempt === 1 && resumingSession) {
           const previous = this.sessionId;
           console.warn(`[${this.channelId}] stale session ${previous || '(unknown)'} — retrying with fresh session`);
           this.sessionId = null;
@@ -438,18 +453,31 @@ async function syncOneSession(guild, session) {
 
   if (managedSessions.has(sessionId)) {
     const managed = managedSessions.get(sessionId);
+    const repo = extractRepo(session);
+    // Keep the repo field up to date in case it was missing on first registration.
+    if (repo && managed.repo !== repo) {
+      managed.repo = repo;
+      saveState();
+    }
     if (managed.state !== newState) {
+      const previousState = managed.state;
       managed.state = newState;
       saveState();
-      try {
-        const ch = guild.channels.cache.get(managed.channelId);
-        if (ch) {
-          await ch.send(`ℹ️ **Status updated:** \`${newState}\``).catch((err) => {
-            console.error(`[sync] status update send failed for ${sessionId}: ${err.message}`);
-          });
+      // Skip the Discord notification when the previous state was null — that
+      // means the session was just registered (e.g. via handleNewTask) and we
+      // haven't seen a real state from Jules yet.  Posting "Status updated:
+      // unspecified" on the very first sync is confusing and not actionable.
+      if (previousState !== null) {
+        try {
+          const ch = guild.channels.cache.get(managed.channelId);
+          if (ch) {
+            await ch.send(`ℹ️ **Status updated:** \`${newState}\``).catch((err) => {
+              console.error(`[sync] status update send failed for ${sessionId}: ${err.message}`);
+            });
+          }
+        } catch (err) {
+          console.error(`[sync] status update error for ${sessionId}: ${err.message}`);
         }
-      } catch (err) {
-        console.error(`[sync] status update error for ${sessionId}: ${err.message}`);
       }
     }
     return;
@@ -624,7 +652,7 @@ async function handleNewTask(msg, repo, baseText, attachments) {
       await ch.edit({ name: chName, topic: `Jules session ${sessionId} — ${repo}` }).catch((err) => {
         console.error(`[new-task] channel rename failed: ${err.message}`);
       });
-      managedSessions.set(sessionId, { channelId: ch.id, repo, state: 'created' });
+      managedSessions.set(sessionId, { channelId: ch.id, repo, state: null });
       // sessions.set was already called by agent.send() when creating the new session.
       saveState();
       console.log(`[new-task] ${repo} → session ${sessionId} → #${chName} (${ch.id})`);
