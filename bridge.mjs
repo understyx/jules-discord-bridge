@@ -161,7 +161,7 @@ class ChannelAgent {
     this._idleTimer = t;
   }
 
-  async send(content) {
+  async send(content, systemPrompt = 'You are a helpful coding agent.') {
     if (this.closed) throw new Error('agent closed');
     if (this.pendingResolve) throw new Error('agent busy with previous turn');
     this._touch();
@@ -169,37 +169,37 @@ class ChannelAgent {
     // We mock pendingResolve to lock the agent so idle eviction doesn't kill it mid-turn
     this.pendingResolve = true;
 
-    try {
-      if (this.sessionId && !this.session) {
-        this.session = julesClient.session(this.sessionId);
-      } else if (!this.session) {
-        this.session = await julesClient.session({ prompt: 'You are a helpful coding agent.' });
-        this.sessionId = this.session.id;
-        sessions.set(this.channelId, this.sessionId);
-        saveState();
-        console.log(`[${this.channelId}] session=${this.sessionId}`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (this.sessionId && !this.session) {
+          this.session = julesClient.session(this.sessionId);
+        } else if (!this.session) {
+          this.session = await julesClient.session({ prompt: systemPrompt });
+          this.sessionId = this.session.id;
+          sessions.set(this.channelId, this.sessionId);
+          saveState();
+          console.log(`[${this.channelId}] session=${this.sessionId}`);
+        }
+
+        const reply = await this.session.ask(content);
+        this.pendingResolve = null;
+        return { text: reply.message };
+      } catch (err) {
+        const is404 = err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'));
+        if (is404 && attempt === 1) {
+          const previous = this.sessionId;
+          console.warn(`[${this.channelId}] stale session ${previous || '(unknown)'} — retrying with fresh session`);
+          this.sessionId = null;
+          this.session = null;
+          sessions.delete(this.channelId);
+          saveState();
+          continue; // retry
+        }
+
+        this.pendingResolve = null;
+        console.error(`[${this.channelId}] stream error: ${err.message}`);
+        return { text: '', error: err.message };
       }
-
-      const reply = await this.session.ask(content);
-      this.pendingResolve = null;
-      return { text: reply.message };
-    } catch (err) {
-      this.pendingResolve = null;
-      console.error(`[${this.channelId}] stream error: ${err.message}`);
-
-      if (err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'))) {
-        const previous = this.sessionId;
-        this.sessionId = null;
-        this.session = null;
-        sessions.delete(this.channelId);
-        saveState();
-        return {
-          text: '',
-          error: `stale session ${previous || '(unknown)'} cleared — please resend`,
-        };
-      }
-
-      return { text: '', error: err.message };
     }
   }
 
@@ -276,6 +276,9 @@ async function processQueue(channelId) {
     const content = buildContent(baseText, attachments);
     if (!content) continue;
 
+    const access = loadAccess();
+    const systemPrompt = access.groups?.[channelId]?.systemPrompt;
+
     try {
       await msg.channel.sendTyping().catch(() => {});
       const typingTimer = setInterval(() => msg.channel.sendTyping().catch(() => {}), 8000);
@@ -284,7 +287,7 @@ async function processQueue(channelId) {
       const t0 = Date.now();
       console.log(`[${channelId}] send: ${typeof content === 'string' ? content.slice(0,80) : `[${content.length} blocks]`}`);
 
-      const result = await agent.send(content);
+      const result = await agent.send(content, systemPrompt);
       clearInterval(typingTimer);
       console.log(`[${channelId}] turn ${(turnCounts.get(channelId) ?? 0) + 1} done in ${Date.now() - t0}ms`);
 
