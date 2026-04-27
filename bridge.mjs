@@ -261,11 +261,14 @@ class ChannelAgent {
   /**
    * Send a user message to the Jules session and stream the response.
    *
+   * When no session exists yet, `content` is used as the initial prompt (Jules
+   * starts working on it immediately — no separate `session.send()` needed).
+   * For existing sessions each call sends a follow-up message via `session.send()`.
+   *
    * @param {string|Array} content  Formatted message content.
-   * @param {string} systemPrompt   Used only when creating a brand-new session.
    * @param {object|null} source    Jules source object (e.g. `{ github: 'org/repo', baseBranch: 'main' }`).
    */
-  async send(content, systemPrompt = 'You are a helpful coding agent.', source = null) {
+  async send(content, source = null) {
     if (this.closed) throw new Error('agent closed');
     if (this.pendingResolve) throw new Error('agent busy with previous turn');
     this._touch();
@@ -275,20 +278,27 @@ class ChannelAgent {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        if (this.sessionId && !this.session) {
-          this.session = julesClient.session(this.sessionId);
-        } else if (!this.session) {
-          const opts = { prompt: systemPrompt };
-          if (source) opts.source = source;
-          this.session = await julesClient.session(opts);
-          this.sessionId = this.session.id;
-          sessions.set(this.channelId, this.sessionId);
-          saveState();
-          console.log(`[${this.channelId}] session=${this.sessionId}${source ? ` source=${JSON.stringify(source)}` : ''}`);
+        if (!this.session) {
+          if (this.sessionId) {
+            // Resume an existing session — send the new message to it.
+            this.session = julesClient.session(this.sessionId);
+            await this.session.send(content);
+          } else {
+            // Brand-new session: use the user's message as the initial prompt so
+            // Jules starts working on it immediately (no separate send needed).
+            const opts = { prompt: content };
+            if (source) opts.source = source;
+            this.session = await julesClient.session(opts);
+            this.sessionId = this.session.id;
+            sessions.set(this.channelId, this.sessionId);
+            saveState();
+            console.log(`[${this.channelId}] session=${this.sessionId}${source ? ` source=${JSON.stringify(source)}` : ''}`);
+          }
+        } else {
+          // Session object already loaded — this is a follow-up turn.
+          await this.session.send(content);
         }
 
-        // Fire-and-forget the user message, then stream the agent's activities.
-        await this.session.send(content);
         const result = await this._collectStream();
         this.pendingResolve = null;
         return result;
@@ -584,35 +594,41 @@ async function handleNewTask(msg, repo, baseText, attachments) {
     // Build the Jules source object. repo is always "owner/repo" format here
     // (populated from extractRepo / newTaskChannels.set), so the slash is guaranteed.
     const source = { github: repo, baseBranch: 'main' };
-    const systemPrompt = `You are a helpful coding agent working on ${repo}.`;
 
-    // Create the Jules session.
-    const sessionOpts = { prompt: systemPrompt, source };
-    const newSession = await julesClient.session(sessionOpts);
-
-    // Create the Discord text channel for this session.
-    const chName = sessionChannelName(newSession.id);
+    // Create a placeholder Discord channel. We don't have a session ID yet —
+    // agent.send() will create the session using the user's message as the
+    // initial prompt and we'll rename the channel once we have the ID.
+    const tempName = sanitizeChannelName(`task-pending-${Date.now().toString().slice(-8)}-${Math.random().toString(36).slice(2, 6)}`);
     const ch = await managedGuild.channels.create({
-      name: chName,
+      name: tempName,
       type: ChannelType.GuildText,
       parent: categoryId ?? undefined,
-      topic: `Jules session ${newSession.id} — ${repo}`,
     });
-
-    managedSessions.set(newSession.id, { channelId: ch.id, repo, state: 'created' });
-    sessions.set(ch.id, newSession.id);
-    saveState();
-    console.log(`[new-task] ${repo} → session ${newSession.id} → #${ch.name} (${ch.id})`);
 
     await msg
       .reply(`✅ Opened <#${ch.id}> for \`${repo}\`. Sending your task now…`)
       .catch(() => {});
 
-    // Forward the user's message as the first turn inside the new channel.
+    // Send the user's message as the first (and initial-prompt) turn.
+    // agent.send() creates the Jules session with content as the prompt and
+    // streams the response — no pre-created session needed.
     const agent = getAgent(ch.id);
     const t0 = Date.now();
-    const result = await agent.send(content, systemPrompt, source);
+    const result = await agent.send(content, source);
     console.log(`[new-task] first turn done in ${Date.now() - t0}ms`);
+
+    // Now we have the session ID — update the channel name and topic.
+    const sessionId = agent.sessionId;
+    if (sessionId) {
+      const chName = sessionChannelName(sessionId);
+      await ch.edit({ name: chName, topic: `Jules session ${sessionId} — ${repo}` }).catch((err) => {
+        console.error(`[new-task] channel rename failed: ${err.message}`);
+      });
+      managedSessions.set(sessionId, { channelId: ch.id, repo, state: 'created' });
+      // sessions.set was already called by agent.send() when creating the new session.
+      saveState();
+      console.log(`[new-task] ${repo} → session ${sessionId} → #${chName} (${ch.id})`);
+    }
 
     if (result.awaitingApproval) {
       const planText = formatPlan(result.plan);
@@ -787,7 +803,6 @@ async function processQueue(channelId) {
 
     const access = loadAccess();
     const group = access.groups?.[channelId] || {};
-    const systemPrompt = group.systemPrompt;
     const source = group.source || null;
 
     try {
@@ -798,7 +813,7 @@ async function processQueue(channelId) {
       const t0 = Date.now();
       console.log(`[${channelId}] send: ${typeof content === 'string' ? content.slice(0, 80) : `[${content.length} blocks]`}`);
 
-      const result = await agent.send(content, systemPrompt, source);
+      const result = await agent.send(content, source);
       clearInterval(typingTimer);
       console.log(`[${channelId}] turn ${(turnCounts.get(channelId) ?? 0) + 1} done in ${Date.now() - t0}ms`);
 
